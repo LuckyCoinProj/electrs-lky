@@ -816,25 +816,38 @@ fn handle_request(
             None,
             None,
         ) => {
+            log::debug!(
+                "Handling GET request for type: {}, script: {}",
+                script_type,
+                script_str
+            );
+
             let script_hash = to_scripthash(script_type, script_str, config.network_type)?;
+
             let max_txs = query_params
                 .get("max_txs")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(config.rest_default_chain_txs_per_page);
+            log::debug!("max_txs parameter: {}", max_txs);
+
             let after_txid = query_params
                 .get("after_txid")
                 .and_then(|s| s.parse::<Txid>().ok());
+            log::debug!("after_txid parameter: {:?}", after_txid);
 
             let mut txs = vec![];
 
             let after_txid_location = if let Some(txid) = &after_txid {
-                find_txid(txid, &query.mempool(), query.chain())
+                let location = find_txid(txid, &query.mempool(), query.chain());
+                location
             } else {
+                log::debug!("No after_txid provided; defaulting to Mempool.");
                 TxidLocation::Mempool
             };
 
             let confirmed_block_height = match after_txid_location {
                 TxidLocation::Mempool => {
+                    log::debug!("Searching in mempool for transactions...");
                     txs.extend(
                         query
                             .mempool()
@@ -842,52 +855,51 @@ fn handle_request(
                             .into_iter()
                             .map(|tx| (tx, None)),
                     );
+                    log::debug!("Found {} transactions in mempool.", txs.len());
                     None
                 }
                 TxidLocation::None => {
+                    log::error!("after_txid not found in mempool or chain.");
                     return Err(HttpError(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         String::from("after_txid not found"),
                     ));
                 }
-                TxidLocation::Chain(height) => Some(height),
+                TxidLocation::Chain(height) => {
+                    log::debug!("after_txid found in chain at height: {}", height);
+                    Some(height)
+                }
             };
 
             if txs.len() < max_txs {
-                // Decide what to pass to `chain().history`:
-                let after_txid_ref = match after_txid_location {
-                    // If the TxID was found in the mempool:
-                    TxidLocation::Mempool => {
-                        // - If mempool found zero subsequent transactions,
-                        //   let's still pass the original `after_txid` to the chain call
-                        //   so we can look for on-chain transactions after it.
-                        if txs.is_empty() {
-                            after_txid.as_ref()
-                        } else {
-                            // If mempool found some transactions, skip chaining by TxID
-                            None
-                        }
-                    }
-                    // If the TxID is confirmed in the chain, we rely on the chain height below
-                    TxidLocation::Chain(_height) => after_txid.as_ref(),
-                    // If None, we already returned the 422 error above
-                    TxidLocation::None => unreachable!("We returned early for TxidLocation::None"),
+                let after_txid_ref = if !txs.is_empty() {
+                    log::debug!("Transactions already found in mempool; ignoring after_txid for chain search.");
+                    None
+                } else {
+                    log::debug!("Using after_txid for chain search.");
+                    after_txid.as_ref()
                 };
-
+                let remaining_txs = max_txs - txs.len();
+                log::debug!(
+                    "Searching in chain for up to {} more transactions...",
+                    remaining_txs
+                );
                 txs.extend(
                     query
                         .chain()
                         .history(
                             &script_hash[..],
                             after_txid_ref,
-                            confirmed_block_height.map(|h| h as usize),
-                            max_txs - txs.len(),
+                            confirmed_block_height.map(|value| value as usize),
+                            remaining_txs,
                         )
                         .map(|res| res.map(|(tx, blockid)| (tx, Some(blockid))))
                         .collect::<Result<Vec<_>, _>>()?,
                 );
+                log::debug!("Found {} additional transactions in chain.", txs.len());
             }
 
+            log::debug!("Preparing {} transactions for response.", txs.len());
             json_response(prepare_txs(txs, query, config), TTL_SHORT)
         }
 
