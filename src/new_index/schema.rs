@@ -2,7 +2,7 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::VarInt;
-use hex::{DisplayHex, FromHex};
+use hex::FromHex;
 use itertools::Itertools;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
