@@ -2,10 +2,10 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::VarInt;
-use sha2::{Sha256, Digest};
 use hex::FromHex;
 use itertools::Itertools;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -16,10 +16,6 @@ use elements::{
     AssetId,
 };
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::Path;
-use std::sync::{Arc, RwLock};
-use std::convert::TryInto;
 use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
 };
@@ -31,6 +27,11 @@ use crate::util::{
     bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
     BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
 };
+use rayon::iter::ParallelIterator;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::convert::TryInto;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
 use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
@@ -237,7 +238,6 @@ impl Indexer {
     }
 
     fn start_auto_compactions(&self, db: &DB) {
-
         let key = b"F".to_vec();
         if db.get(&key).is_none() {
             db.full_compaction();
@@ -454,55 +454,58 @@ impl ChainQuery {
             &TxHistoryRow::prefix_height(code, &hash[..], start_height as u32),
         )
     }
-    fn history_iter_scan_reverse(&self, code: u8, hash: &[u8]) -> ReverseScanIterator {
-        self.store.history_db.iter_scan_reverse(
-            &TxHistoryRow::filter(code, &hash[..]),
-            &TxHistoryRow::prefix_end(code, &hash[..]),
-        )
-    }
-
-    pub fn history(
-        &self,
-        scripthash: &[u8],
-        last_seen_txid: Option<&Txid>,
-        limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
-        // scripthash lookup
-        self._history(b'H', scripthash, last_seen_txid, limit)
-    }
-
-    fn _history(
+    fn history_iter_scan_reverse(
         &self,
         code: u8,
         hash: &[u8],
-        last_seen_txid: Option<&Txid>,
-        limit: usize,
-    ) -> Vec<(Transaction, BlockId)> {
-        let _timer_scan = self.start_timer("history");
-        let txs_conf = self
-            .history_iter_scan_reverse(code, hash)
-            .map(|row| TxHistoryRow::from_row(row).get_txid())
-            // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
-            .unique()
-            // TODO seek directly to last seen tx without reading earlier rows
-            .skip_while(|txid| {
-                // skip until we reach the last_seen_txid
-                last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
-            })
-            .skip(match last_seen_txid {
-                Some(_) => 1, // skip the last_seen_txid itself
-                None => 0,
-            })
-            .filter_map(|txid| self.tx_confirming_block(&txid).map(|b| (txid, b)))
-            .take(limit)
-            .collect::<Vec<(Txid, BlockId)>>();
+        start_height: Option<usize>,
+    ) -> ReverseScanIterator {
+        self.store.history_db.iter_scan_reverse(
+            &TxHistoryRow::filter(code, hash),
+            &start_height.map_or(TxHistoryRow::prefix_end(code, hash), |start_height| {
+                TxHistoryRow::prefix_height_end(code, hash, start_height)
+            }),
+        )
+    }
 
-        self.lookup_txns(&txs_conf)
-            .expect("failed looking up txs in history index")
-            .into_iter()
-            .zip(txs_conf)
-            .map(|(tx, (_, blockid))| (tx, blockid))
-            .collect()
+    pub fn history<'a>(
+        &'a self,
+        scripthash: &[u8],
+        last_seen_txid: Option<&'a Txid>,
+        start_height: Option<usize>,
+        limit: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId)>> + 'a {
+        // scripthash lookup
+        self._history(b'H', scripthash, last_seen_txid, start_height, limit)
+    }
+
+    fn _history<'a>(
+        &'a self,
+        code: u8,
+        hash: &[u8],
+        last_seen_txid: Option<&'a Txid>,
+        start_height: Option<usize>,
+        limit: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId)>> + 'a {
+        let _timer_scan = self.start_timer("history");
+
+        self.lookup_txns(
+            self.history_iter_scan_reverse(code, hash, start_height)
+                .map(|row| TxHistoryRow::from_row(row).get_txid())
+                // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
+                .unique()
+                // TODO seek directly to last seen tx without reading earlier rows
+                .skip_while(move |txid| {
+                    // skip until we reach the last_seen_txid
+                    last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
+                })
+                .skip(match last_seen_txid {
+                    Some(_) => 1, // skip the last_seen_txid itself
+                    None => 0,
+                })
+                .filter_map(move |txid| self.tx_confirming_block(&txid).map(|b| (txid, b))),
+            limit,
+        )
     }
 
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
@@ -811,15 +814,24 @@ impl ChainQuery {
 
     // TODO: can we pass txids as a "generic iterable"?
     // TODO: should also use a custom ThreadPoolBuilder?
-    pub fn lookup_txns(&self, txids: &[(Txid, BlockId)]) -> Result<Vec<Transaction>> {
-        let _timer = self.start_timer("lookup_txns");
+    pub fn lookup_txns<'a, I>(
+        &'a self,
+        txids: I,
+        take: usize,
+    ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId)>> + 'a
+    where
+        I: Iterator<Item = (Txid, BlockId)> + Send + rayon::iter::ParallelBridge + 'a,
+    {
         txids
-            .par_iter()
-            .map(|(txid, blockid)| {
-                self.lookup_txn(txid, Some(&blockid.hash))
-                    .chain_err(|| "missing tx")
+            .take(take)
+            .par_bridge()
+            .map(move |(txid, blockid)| -> Result<_> {
+                Ok((
+                    self.lookup_txn(&txid, Some(&blockid.hash))
+                        .chain_err(|| "missing tx")?,
+                    blockid,
+                ))
             })
-            .collect::<Result<Vec<Transaction>>>()
     }
 
     pub fn lookup_txn(&self, txid: &Txid, blockhash: Option<&BlockHash>) -> Option<Transaction> {
@@ -1432,7 +1444,6 @@ pub struct TxHistoryRow {
 
 impl TxHistoryRow {
     fn new(script: &Script, confirmed_height: u32, txinfo: TxHistoryInfo) -> Self {
-
         let hash = compute_script_hash(&script);
 
         //println!("Computed script hash: {}", DisplayHex::as_hex(&hash));
@@ -1456,6 +1467,10 @@ impl TxHistoryRow {
 
     fn prefix_height(code: u8, hash: &[u8], height: u32) -> Bytes {
         bincode::serialize_big(&(code, full_hash(&hash[..]), height)).unwrap()
+    }
+    fn prefix_height_end(code: u8, hash: &[u8], height: usize) -> Bytes {
+        // u16::MAX for the tx_position ensures we get all transactions at this height
+        bincode::serialize_big(&(code, full_hash(hash), height, u16::MAX)).unwrap()
     }
 
     pub fn into_row(self) -> DBRow {

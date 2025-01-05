@@ -40,6 +40,7 @@ pub struct Config {
     pub electrum_txs_limit: usize,
     pub electrum_banner: String,
     pub electrum_rpc_logging: Option<RpcLogging>,
+    pub rest_default_chain_txs_per_page: usize,
 
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
@@ -191,6 +192,11 @@ impl Config {
                     .long("electrum-rpc-logging")
                     .help(&rpc_logging_help)
                     .takes_value(true),
+            ).arg(
+                Arg::with_name("rest_default_chain_txs_per_page")
+                    .long("rest-default-chain-txs-per-page")
+                    .help("The default number of on-chain transactions returned by the txs endpoints.")
+                    .default_value("25")
             );
 
         #[cfg(unix)]
@@ -403,6 +409,11 @@ impl Config {
             index_unspendables: m.is_present("index_unspendables"),
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
+            rest_default_chain_txs_per_page: value_t_or_exit!(
+                m,
+                "rest_default_chain_txs_per_page",
+                usize
+            ),
 
             #[cfg(feature = "liquid")]
             parent_network,

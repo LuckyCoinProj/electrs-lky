@@ -8,9 +8,9 @@ use elements::{encode::serialize, AssetId};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::iter::FromIterator;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid};
 use crate::config::Config;
@@ -134,18 +134,39 @@ impl Mempool {
             .any(|txin| self.txstore.contains_key(&txin.previous_output.txid))
     }
 
-    pub fn history(&self, scripthash: &[u8], limit: usize) -> Vec<Transaction> {
+    pub fn history(
+        &self,
+        scripthash: &[u8],
+        last_seen_txid: Option<&Txid>,
+        limit: usize,
+    ) -> Vec<Transaction> {
         let _timer = self.latency.with_label_values(&["history"]).start_timer();
         self.history
             .get(scripthash)
-            .map_or_else(|| vec![], |entries| self._history(entries, limit))
+            .map_or_else(std::vec::Vec::new, |entries| {
+                self._history(entries, last_seen_txid, limit)
+            })
     }
 
-    fn _history(&self, entries: &[TxHistoryInfo], limit: usize) -> Vec<Transaction> {
+    fn _history(
+        &self,
+        entries: &[TxHistoryInfo],
+        last_seen_txid: Option<&Txid>,
+        limit: usize,
+    ) -> Vec<Transaction> {
         entries
             .iter()
             .map(|e| e.get_txid())
             .unique()
+            // TODO seek directly to last seen tx without reading earlier rows
+            .skip_while(|txid| {
+                // skip until we reach the last_seen_txid
+                last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
+            })
+            .skip(match last_seen_txid {
+                Some(_) => 1, // skip the last_seen_txid itself
+                None => 0,
+            })
             .take(limit)
             .map(|txid| self.txstore.get(&txid).expect("missing mempool tx"))
             .cloned()
@@ -265,8 +286,8 @@ impl Mempool {
         self.txstore.keys().collect()
     }
 
-     // Get n txids after the given txid in the mempool
-     pub fn txids_page(&self, n: usize, start: Option<Txid>) -> Vec<&Txid> {
+    // Get n txids after the given txid in the mempool
+    pub fn txids_page(&self, n: usize, start: Option<Txid>) -> Vec<&Txid> {
         let _timer = self
             .latency
             .with_label_values(&["txids_page"])
@@ -536,7 +557,12 @@ impl Mempool {
     }
 
     pub fn update(mempool: &Arc<RwLock<Mempool>>, daemon: &Daemon) -> Result<()> {
-        let _timer = mempool.read().unwrap().latency.with_label_values(&["update"]).start_timer();
+        let _timer = mempool
+            .read()
+            .unwrap()
+            .latency
+            .with_label_values(&["update"])
+            .start_timer();
 
         // 1. Determine which transactions are no longer in the daemon's mempool and which ones have newly entered it
         let old_txids = mempool.read().unwrap().old_txids();
