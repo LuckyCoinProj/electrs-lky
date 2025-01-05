@@ -460,12 +460,46 @@ impl ChainQuery {
         hash: &[u8],
         start_height: Option<usize>,
     ) -> ReverseScanIterator {
-        self.store.history_db.iter_scan_reverse(
-            &TxHistoryRow::filter(code, hash),
-            &start_height.map_or(TxHistoryRow::prefix_end(code, hash), |start_height| {
-                TxHistoryRow::prefix_height_end(code, hash, start_height)
-            }),
-        )
+        // Log the inputs
+        log::debug!(
+            "history_iter_scan_reverse called with code={}, hash={}, start_height={:?}",
+            code,
+            hex::encode(hash),
+            start_height
+        );
+
+        // Compute filter key (the prefix to match rows)
+        let filter_key = TxHistoryRow::filter(code, hash);
+        log::debug!(
+            "history_iter_scan_reverse: filter_key = {}",
+            hex::encode(&filter_key)
+        );
+
+        // Compute the start key (the upper bound in the reverse scan)
+        let start_key = start_height
+            .map(|height| {
+                let key = TxHistoryRow::prefix_height_end(code, hash, height);
+                log::debug!(
+                    "history_iter_scan_reverse: using prefix_height_end for start_key at height={}",
+                    height
+                );
+                key
+            })
+            .unwrap_or_else(|| {
+                let key = TxHistoryRow::prefix_end(code, hash);
+                log::debug!("history_iter_scan_reverse: using prefix_end for start_key");
+                key
+            });
+
+        log::debug!(
+            "history_iter_scan_reverse: final start_key = {}",
+            hex::encode(&start_key)
+        );
+
+        // Now perform the reverse scan
+        self.store
+            .history_db
+            .iter_scan_reverse(&filter_key, &start_key)
     }
 
     pub fn history<'a>(
@@ -487,27 +521,65 @@ impl ChainQuery {
         start_height: Option<usize>,
         limit: usize,
     ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId)>> + 'a {
+        log::debug!(
+            "_history called with code={}, hash={}, last_seen_txid={:?}, start_height={:?}, limit={}",
+            code,
+            hex::encode(hash),
+            last_seen_txid,
+            start_height,
+            limit
+        );
+
         let _timer_scan = self.start_timer("history");
 
-        self.lookup_txns(
-            self.history_iter_scan_reverse(code, hash, start_height)
-                .map(|row| TxHistoryRow::from_row(row).get_txid())
-                // XXX: unique() requires keeping an in-memory list of all txids, can we avoid that?
-                .unique()
-                // TODO seek directly to last seen tx without reading earlier rows
-                .skip_while(move |txid| {
-                    // skip until we reach the last_seen_txid
-                    last_seen_txid.map_or(false, |last_seen_txid| last_seen_txid != txid)
-                })
-                .skip(match last_seen_txid {
-                    Some(_) => 1, // skip the last_seen_txid itself
-                    None => 0,
-                })
-                .filter_map(move |txid| self.tx_confirming_block(&txid).map(|b| (txid, b))),
-            limit,
-        )
-    }
+        // For demonstration, let's add a single debug line that logs
+        // each row's TxID before we do the skip logic. But *beware*:
+        // this might produce a LOT of logs if the dataset is large.
+        let iter = self
+            .history_iter_scan_reverse(code, hash, start_height)
+            .map(|row| {
+                let txid = TxHistoryRow::from_row(row).get_txid();
+                log::trace!("_history: found txid in DB = {}", txid);
+                txid
+            })
+            // .unique() is still here
+            .unique()
+            // We can log *why* we skip
+            .skip_while(move |txid| {
+                let skip = last_seen_txid.map_or(false, |seen| seen != txid);
+                if skip {
+                    // This might get chatty. Consider .trace! level if needed
+                    log::debug!(
+                        "Skipping txid {} until we reach last_seen_txid {:?}",
+                        txid,
+                        last_seen_txid
+                    );
+                }
+                skip
+            })
+            .skip(match last_seen_txid {
+                Some(_) => 1, // skip the last_seen_txid itself
+                None => 0,
+            })
+            .filter_map(move |txid| {
+                match self.tx_confirming_block(&txid) {
+                    Some(block_id) => {
+                        log::trace!("Tx {} is confirmed in block {:?}", txid, block_id);
+                        Some((txid, block_id))
+                    }
+                    None => {
+                        // Possibly log at trace for unknown confirmations
+                        log::trace!("No confirming block found for txid {}", txid);
+                        None
+                    }
+                }
+            });
 
+        // Final lookup of transactions
+        log::debug!("Calling self.lookup_txns(...) with limit={}", limit);
+
+        self.lookup_txns(iter, limit)
+    }
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<(Txid, BlockId)> {
         // scripthash lookup
         self._history_txids(b'H', scripthash, limit)
