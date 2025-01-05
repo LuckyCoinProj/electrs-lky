@@ -478,7 +478,9 @@ impl ChainQuery {
         // Compute the start key (the upper bound in the reverse scan)
         let start_key = start_height
             .map(|height| {
-                let key = TxHistoryRow::prefix_height_end(code, hash, height);
+                let height_key: u32 = height.try_into().expect("Height is out of range for u32");
+
+                let key = TxHistoryRow::prefix_height_end(code, hash, height_key);
                 log::debug!(
                     "history_iter_scan_reverse: using prefix_height_end for start_key at height={}",
                     height
@@ -1563,7 +1565,7 @@ impl TxHistoryRow {
     }
 
     // prefix representing the end of a given block (used for reverse scans)
-    fn prefix_height_end(code: u8, hash: &[u8], height: usize) -> Bytes {
+    fn prefix_height_end(code: u8, hash: &[u8], height: u32) -> Bytes {
         // u16::MAX for the tx_position ensures we get all transactions at this height
         bincode::serialize_big(&(code, full_hash(hash), height, u16::MAX)).unwrap()
     }
