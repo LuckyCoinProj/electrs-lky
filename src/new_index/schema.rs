@@ -2,7 +2,7 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::VarInt;
-use hex::FromHex;
+use hex::{DisplayHex, FromHex};
 use itertools::Itertools;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -464,7 +464,7 @@ impl ChainQuery {
         log::debug!(
             "history_iter_scan_reverse called with code={}, hash={}, start_height={:?}",
             code,
-            hex::encode(hash),
+            hash.as_hex(),
             start_height
         );
 
@@ -472,7 +472,7 @@ impl ChainQuery {
         let filter_key = TxHistoryRow::filter(code, hash);
         log::debug!(
             "history_iter_scan_reverse: filter_key = {}",
-            hex::encode(&filter_key)
+            filter_key.as_hex()
         );
 
         // Compute the start key (the upper bound in the reverse scan)
@@ -493,7 +493,7 @@ impl ChainQuery {
 
         log::debug!(
             "history_iter_scan_reverse: final start_key = {}",
-            hex::encode(&start_key)
+            start_key.as_hex()
         );
 
         // Now perform the reverse scan
@@ -524,7 +524,7 @@ impl ChainQuery {
         log::debug!(
             "_history called with code={}, hash={}, last_seen_txid={:?}, start_height={:?}, limit={}",
             code,
-            hex::encode(hash),
+            hash.as_hex(),
             last_seen_txid,
             start_height,
             limit
