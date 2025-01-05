@@ -1155,9 +1155,16 @@ fn index_blocks(
         .par_iter() // serialization is CPU-intensive
         .map(|b| {
             let mut rows = vec![];
-            for tx in &b.block.txdata {
+            for (idx, tx) in b.block.txdata.iter().enumerate() {
                 let height = b.entry.height() as u32;
-                index_transaction(tx, height, previous_txos_map, &mut rows, iconfig);
+                index_transaction(
+                    tx,
+                    height,
+                    idx as u16,
+                    previous_txos_map,
+                    &mut rows,
+                    iconfig,
+                );
             }
             rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
             rows
@@ -1170,13 +1177,14 @@ fn index_blocks(
 fn index_transaction(
     tx: &Transaction,
     confirmed_height: u32,
+    tx_position: u16,
     previous_txos_map: &HashMap<OutPoint, TxOut>,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
 ) {
     // persist history index:
-    //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
-    //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
+    //      H{funding-scripthash}{spending-height}{spending-block-pos}S{spending-txid:vin}{funding-txid:vout} → ""
+    //      H{funding-scripthash}{funding-height}{funding-block-pos}F{funding-txid:vout} → ""
     // persist "edges" for fast is-this-TXO-spent check
     //      S{funding-txid:vout}{spending-txid:vin} → ""
     let txid = full_hash(&tx.txid()[..]);
@@ -1185,10 +1193,11 @@ fn index_transaction(
             let history = TxHistoryRow::new(
                 &txo.script_pubkey,
                 confirmed_height,
+                tx_position,
                 TxHistoryInfo::Funding(FundingInfo {
                     txid,
-                    vout: txo_index as u16,
-                    value: txo.value.amount_value(),
+                    vout: txo_index as u32,
+                    value: txo.value.to_sat(),
                 }),
             );
             rows.push(history.into_row());
@@ -1211,21 +1220,22 @@ fn index_transaction(
         let history = TxHistoryRow::new(
             &prev_txo.script_pubkey,
             confirmed_height,
+            tx_position,
             TxHistoryInfo::Spending(SpendingInfo {
                 txid,
-                vin: txi_index as u16,
+                vin: txi_index as u32,
                 prev_txid: full_hash(&txi.previous_output.txid[..]),
-                prev_vout: txi.previous_output.vout as u16,
-                value: prev_txo.value.amount_value(),
+                prev_vout: txi.previous_output.vout,
+                value: prev_txo.value.to_sat(),
             }),
         );
         rows.push(history.into_row());
 
         let edge = TxEdgeRow::new(
             full_hash(&txi.previous_output.txid[..]),
-            txi.previous_output.vout as u16,
+            txi.previous_output.vout,
             txid,
-            txi_index as u16,
+            txi_index as u32,
         );
         rows.push(edge.into_row());
     }
@@ -1235,6 +1245,7 @@ fn index_transaction(
     asset::index_confirmed_tx_assets(
         tx,
         confirmed_height,
+        tx_position,
         iconfig.network,
         iconfig.parent_network,
         rows,
@@ -1456,25 +1467,31 @@ impl BlockRow {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct FundingInfo {
     pub txid: FullHash,
-    pub vout: u16,
+    pub vout: u32,
     pub value: Value,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct SpendingInfo {
     pub txid: FullHash, // spending transaction
-    pub vin: u16,
+    pub vin: u32,
     pub prev_txid: FullHash, // funding transaction
-    pub prev_vout: u16,
+    pub prev_vout: u32,
     pub value: Value,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum TxHistoryInfo {
-    Funding(FundingInfo),
+    // If a spend and a fund for the same scripthash
+    // occur in the same tx, spends should come first.
+    // This ordering comes from the enum order.
     Spending(SpendingInfo),
+    Funding(FundingInfo),
 
     #[cfg(feature = "liquid")]
     Issuing(asset::IssuingInfo),
@@ -1503,10 +1520,12 @@ impl TxHistoryInfo {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct TxHistoryKey {
     pub code: u8,              // H for script history or I for asset history (elements only)
     pub hash: FullHash, // either a scripthash (always on bitcoin) or an asset id (elements only)
     pub confirmed_height: u32, // MUST be serialized as big-endian (for correct scans).
+    pub tx_position: u16, // MUST be serialized as big-endian (for correct scans). Position in block.
     pub txinfo: TxHistoryInfo,
 }
 
@@ -1515,15 +1534,17 @@ pub struct TxHistoryRow {
 }
 
 impl TxHistoryRow {
-    fn new(script: &Script, confirmed_height: u32, txinfo: TxHistoryInfo) -> Self {
-        let hash = compute_script_hash(&script);
-
-        //println!("Computed script hash: {}", DisplayHex::as_hex(&hash));
-
+    fn new(
+        script: &Script,
+        confirmed_height: u32,
+        tx_position: u16,
+        txinfo: TxHistoryInfo,
+    ) -> Self {
         let key = TxHistoryKey {
             code: b'H',
-            hash,
+            hash: compute_script_hash(script),
             confirmed_height,
+            tx_position,
             txinfo,
         };
         TxHistoryRow { key }
@@ -1534,12 +1555,14 @@ impl TxHistoryRow {
     }
 
     fn prefix_end(code: u8, hash: &[u8]) -> Bytes {
-        bincode::serialize_big(&(code, full_hash(&hash[..]), std::u32::MAX)).unwrap()
+        bincode::serialize_big(&(code, full_hash(hash), u32::MAX)).unwrap()
     }
 
     fn prefix_height(code: u8, hash: &[u8], height: u32) -> Bytes {
-        bincode::serialize_big(&(code, full_hash(&hash[..]), height)).unwrap()
+        bincode::serialize_big(&(code, full_hash(hash), height)).unwrap()
     }
+
+    // prefix representing the end of a given block (used for reverse scans)
     fn prefix_height_end(code: u8, hash: &[u8], height: usize) -> Bytes {
         // u16::MAX for the tx_position ensures we get all transactions at this height
         bincode::serialize_big(&(code, full_hash(hash), height, u16::MAX)).unwrap()
@@ -1572,11 +1595,11 @@ impl TxHistoryInfo {
         match self {
             TxHistoryInfo::Funding(ref info) => OutPoint {
                 txid: deserialize(&info.txid).unwrap(),
-                vout: info.vout as u32,
+                vout: info.vout,
             },
             TxHistoryInfo::Spending(ref info) => OutPoint {
                 txid: deserialize(&info.prev_txid).unwrap(),
-                vout: info.prev_vout as u32,
+                vout: info.prev_vout,
             },
             #[cfg(feature = "liquid")]
             TxHistoryInfo::Issuing(_)
@@ -1591,9 +1614,9 @@ impl TxHistoryInfo {
 struct TxEdgeKey {
     code: u8,
     funding_txid: FullHash,
-    funding_vout: u16,
+    funding_vout: u32,
     spending_txid: FullHash,
-    spending_vin: u16,
+    spending_vin: u32,
 }
 
 struct TxEdgeRow {
@@ -1603,9 +1626,9 @@ struct TxEdgeRow {
 impl TxEdgeRow {
     fn new(
         funding_txid: FullHash,
-        funding_vout: u16,
+        funding_vout: u32,
         spending_txid: FullHash,
-        spending_vin: u16,
+        spending_vin: u32,
     ) -> Self {
         let key = TxEdgeKey {
             code: b'S',
@@ -1619,8 +1642,7 @@ impl TxEdgeRow {
 
     fn filter(outpoint: &OutPoint) -> Bytes {
         // TODO build key without using bincode? [ b"S", &outpoint.txid[..], outpoint.vout?? ].concat()
-        bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout as u16))
-            .unwrap()
+        bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout)).unwrap()
     }
 
     fn into_row(self) -> DBRow {
