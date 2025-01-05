@@ -461,19 +461,9 @@ impl ChainQuery {
         start_height: Option<usize>,
     ) -> ReverseScanIterator {
         // Log the inputs
-        log::debug!(
-            "history_iter_scan_reverse called with code={}, hash={}, start_height={:?}",
-            code,
-            hash.as_hex(),
-            start_height
-        );
 
         // Compute filter key (the prefix to match rows)
         let filter_key = TxHistoryRow::filter(code, hash);
-        log::debug!(
-            "history_iter_scan_reverse: filter_key = {}",
-            filter_key.as_hex()
-        );
 
         // Compute the start key (the upper bound in the reverse scan)
         let start_key = start_height
@@ -481,22 +471,13 @@ impl ChainQuery {
                 let height_key: u32 = height.try_into().expect("Height is out of range for u32");
 
                 let key = TxHistoryRow::prefix_height_end(code, hash, height_key);
-                log::debug!(
-                    "history_iter_scan_reverse: using prefix_height_end for start_key at height={}",
-                    height
-                );
+
                 key
             })
             .unwrap_or_else(|| {
                 let key = TxHistoryRow::prefix_end(code, hash);
-                log::debug!("history_iter_scan_reverse: using prefix_end for start_key");
                 key
             });
-
-        log::debug!(
-            "history_iter_scan_reverse: final start_key = {}",
-            start_key.as_hex()
-        );
 
         // Now perform the reverse scan
         self.store
@@ -523,15 +504,6 @@ impl ChainQuery {
         start_height: Option<usize>,
         limit: usize,
     ) -> impl rayon::iter::ParallelIterator<Item = Result<(Transaction, BlockId)>> + 'a {
-        log::debug!(
-            "_history called with code={}, hash={}, last_seen_txid={:?}, start_height={:?}, limit={}",
-            code,
-            hash.as_hex(),
-            last_seen_txid,
-            start_height,
-            limit
-        );
-
         let _timer_scan = self.start_timer("history");
 
         // For demonstration, let's add a single debug line that logs
@@ -551,11 +523,6 @@ impl ChainQuery {
                 let skip = last_seen_txid.map_or(false, |seen| seen != txid);
                 if skip {
                     // This might get chatty. Consider .trace! level if needed
-                    log::debug!(
-                        "Skipping txid {} until we reach last_seen_txid {:?}",
-                        txid,
-                        last_seen_txid
-                    );
                 }
                 skip
             })
@@ -578,7 +545,6 @@ impl ChainQuery {
             });
 
         // Final lookup of transactions
-        log::debug!("Calling self.lookup_txns(...) with limit={}", limit);
 
         self.lookup_txns(iter, limit)
     }
