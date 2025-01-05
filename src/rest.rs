@@ -854,20 +854,33 @@ fn handle_request(
             };
 
             if txs.len() < max_txs {
-                let after_txid_ref = if !txs.is_empty() {
-                    // If there are any txs, we know mempool found the
-                    // after_txid IF it exists... so always return None.
-                    None
-                } else {
-                    after_txid.as_ref()
+                // Decide what to pass to `chain().history`:
+                let after_txid_ref = match after_txid_location {
+                    // If the TxID was found in the mempool:
+                    TxidLocation::Mempool => {
+                        // - If mempool found zero subsequent transactions,
+                        //   let's still pass the original `after_txid` to the chain call
+                        //   so we can look for on-chain transactions after it.
+                        if txs.is_empty() {
+                            after_txid.as_ref()
+                        } else {
+                            // If mempool found some transactions, skip chaining by TxID
+                            None
+                        }
+                    }
+                    // If the TxID is confirmed in the chain, we rely on the chain height below
+                    TxidLocation::Chain(_height) => after_txid.as_ref(),
+                    // If None, we already returned the 422 error above
+                    TxidLocation::None => unreachable!("We returned early for TxidLocation::None"),
                 };
+
                 txs.extend(
                     query
                         .chain()
                         .history(
                             &script_hash[..],
                             after_txid_ref,
-                            confirmed_block_height.map(|value| value as usize),
+                            confirmed_block_height.map(|h| h as usize),
                             max_txs - txs.len(),
                         )
                         .map(|res| res.map(|(tx, blockid)| (tx, Some(blockid))))
